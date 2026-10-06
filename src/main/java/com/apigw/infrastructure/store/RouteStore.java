@@ -59,19 +59,27 @@ public class RouteStore {
     private final ReactiveStringRedisTemplate redis;
     private final ObjectMapper objectMapper;
     private final RouteRevisionStore revisionStore;
+    private final RouteRuleIndex ruleIndex;
 
     @org.springframework.beans.factory.annotation.Autowired
     public RouteStore(ReactiveStringRedisTemplate redis,
                       ObjectMapper objectMapper,
-                      RouteRevisionStore revisionStore) {
+                      RouteRevisionStore revisionStore,
+                      RouteRuleIndex ruleIndex) {
         this.redis = redis;
         this.objectMapper = objectMapper;
         this.revisionStore = revisionStore;
+        this.ruleIndex = ruleIndex;
     }
 
     /** 测试/兼容旧装配：不走全局 revision 协调时，仍可直接读写原 Hash。 */
+    public RouteStore(ReactiveStringRedisTemplate redis, ObjectMapper objectMapper,
+                      RouteRevisionStore revisionStore) {
+        this(redis, objectMapper, revisionStore, null);
+    }
+
     public RouteStore(ReactiveStringRedisTemplate redis, ObjectMapper objectMapper) {
-        this(redis, objectMapper, null);
+        this(redis, objectMapper, null, null);
     }
 
     /** 读全部路由（含子项）。 */
@@ -104,13 +112,15 @@ public class RouteStore {
                         }
                         route.setVersion(0);
                         return Mono.just(route);
-                    });
+                    })
+                    .flatMap(saved -> syncRuleIndex(saved, true));
         }
         return redis.opsForHash().putIfAbsent(ROUTES_KEY, route.getRouteNo(), json)
                 .flatMap(acquired -> Boolean.TRUE.equals(acquired)
                         ? Mono.just(route)
                         : Mono.error(new BizException(
-                                "路由编号已被占用（停用的路由也占号）：" + route.getRouteNo())));
+                                "路由编号已被占用（停用的路由也占号）：" + route.getRouteNo())))
+                .flatMap(saved -> syncRuleIndex(saved, true));
     }
 
     /**
@@ -151,7 +161,7 @@ public class RouteStore {
                             // id 沿用旧的，编号建后不可改；整树覆盖子项
                             route.setId(existing.getId());
                             route.setVersion(existing.getVersion() + 1);
-                            return write(route).thenReturn(route);
+                            return write(route).then(syncRuleIndex(route, false));
                         }));
     }
 
@@ -162,6 +172,7 @@ public class RouteStore {
      */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
         if (revisionStore != null) {
+            // 规则索引（apigw:route:rules）不在这里清：它跟着快照版本走，交回给快照轮转回收。
             return revisionStore.commitDelete(routeNo, expectVersion)
                     .flatMap(result -> result.success()
                             ? Mono.empty()
@@ -190,6 +201,24 @@ public class RouteStore {
     private BizException versionConflict(int currentVersion, int expectVersion) {
         return new BizException(409, "你这份配置已经旧了（当前版本 " + currentVersion
                 + "，你手上是 " + expectVersion + "），请重新拉取后再提交");
+    }
+
+    /**
+     * 同步规则索引。
+     *
+     * @param reuseExisting 创建时传 true：同一个编号上如果还留着上一版的规则，接上一起用，
+     *                      免得重建之后再手工把历史规则补一遍。
+     */
+    private Mono<GatewayRoute> syncRuleIndex(GatewayRoute route, boolean reuseExisting) {
+        if (ruleIndex == null) {
+            return Mono.just(route);
+        }
+        Mono<RouteRuleIndex.Rules> base = reuseExisting
+                ? ruleIndex.read(route.getRouteNo()).defaultIfEmpty(new RouteRuleIndex.Rules())
+                : Mono.just(new RouteRuleIndex.Rules());
+        return base.flatMap(existing -> ruleIndex.write(route.getRouteNo(),
+                        existing.plus(RouteRuleIndex.Rules.of(route)))
+                .thenReturn(route));
     }
 
     private Mono<Void> write(GatewayRoute route) {

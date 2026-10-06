@@ -1,6 +1,7 @@
 package com.apigw.proxy.route;
 
 import com.apigw.domain.route.GatewayRoute;
+import com.apigw.infrastructure.store.RouteRuleIndex;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.proxy.config.GatewayProxyProperties;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +31,7 @@ public class RouteCatalog {
     private final RouteStore routeStore;
     private final Duration ttl;
     private final RouteCoordinator coordinator;
+    private final RouteRuleIndex ruleIndex;
 
     private volatile Snapshot snapshot;
     private Mono<List<GatewayRoute>> inflight;
@@ -37,15 +39,22 @@ public class RouteCatalog {
     @Autowired
     public RouteCatalog(RouteStore routeStore,
                         GatewayProxyProperties properties,
-                        RouteCoordinator coordinator) {
+                        RouteCoordinator coordinator,
+                        RouteRuleIndex ruleIndex) {
         this.routeStore = routeStore;
         this.ttl = properties.routeRefreshInterval().multipliedBy(3);
         this.coordinator = coordinator;
+        this.ruleIndex = ruleIndex;
     }
 
     /** 单元测试/关闭协调时使用的兼容构造器。 */
+    public RouteCatalog(RouteStore routeStore, GatewayProxyProperties properties,
+                        RouteCoordinator coordinator) {
+        this(routeStore, properties, coordinator, null);
+    }
+
     public RouteCatalog(RouteStore routeStore, GatewayProxyProperties properties) {
-        this(routeStore, properties, null);
+        this(routeStore, properties, null, null);
     }
 
     public Mono<RouteSnapshot> snapshot() {
@@ -63,6 +72,34 @@ public class RouteCatalog {
      * 当前可用路由列表：新鲜就直接给；过期了拉一份新的并更新快照。
      */
     public Mono<List<GatewayRoute>> routes() {
+        return baseRoutes().flatMap(this::applyRuleIndex);
+    }
+
+    /**
+     * 装配时以规则索引为准：索引里存了这条路由的条件与动作，就直接用索引那份，
+     * 省掉每次刷新都把整条路由 JSON 解一遍；索引里没有的，沿用路由自身那份。
+     */
+    private Mono<List<GatewayRoute>> applyRuleIndex(List<GatewayRoute> routes) {
+        if (ruleIndex == null || routes == null || routes.isEmpty()) {
+            return Mono.just(routes);
+        }
+        return ruleIndex.readAll()
+                .map(index -> {
+                    if (index.isEmpty()) {
+                        return routes;
+                    }
+                    for (GatewayRoute r : routes) {
+                        RouteRuleIndex.Rules rules = index.get(r.getRouteNo());
+                        if (rules != null && !rules.isEmpty()) {
+                            r.replaceRules(rules.conditionRules(), rules.actionRules());
+                        }
+                    }
+                    return routes;
+                })
+                .onErrorResume(err -> Mono.just(routes));
+    }
+
+    private Mono<List<GatewayRoute>> baseRoutes() {
         if (coordinator != null && coordinatorEnabled()) {
             return coordinator.snapshot().map(RouteSnapshot::routes);
         }
