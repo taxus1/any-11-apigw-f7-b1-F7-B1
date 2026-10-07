@@ -28,6 +28,8 @@ public class RouteRevisionStore {
     public static final String CHANNEL = "apigw:route:channel";
     public static final String INSTANCES_KEY = "apigw:route:instances";
     public static final String BARRIER_PREFIX = "apigw:route:barrier:";
+    /** 规则索引 key：提交脚本删除路由时一并清掉同一编号的投影 field。 */
+    public static final String RULES_KEY = RouteRuleIndex.RULES_KEY;
 
     private static final Duration SNAPSHOT_TTL = Duration.ofDays(7);
 
@@ -35,6 +37,10 @@ public class RouteRevisionStore {
 
     /**
      * 返回值：{0=成功, 1=编号占用, 2=路由不存在, 3=版本冲突}，后续元素为 revision / routeVersion。
+     *
+     * <p>DELETE 与规则索引 {@code apigw:route:rules} 的 HDEL 在同一个脚本里完成：
+     * 权威 field 与派生投影必须同生共死，不能让「同编号立刻重建」落在两步之间，
+     * 把旧条件/动作残留在索引里再被新路由捡走。
      */
     private static final RedisScript<List> COMMIT_SCRIPT = new DefaultRedisScript<>(
             """
@@ -42,6 +48,7 @@ public class RouteRevisionStore {
             local revisionKey = KEYS[2]
             local indexKey = KEYS[3]
             local channel = KEYS[4]
+            local rulesKey = KEYS[5]
             local op = ARGV[1]
             local routeNo = ARGV[2]
             local payload = ARGV[3]
@@ -83,6 +90,8 @@ public class RouteRevisionStore {
                 end
               end
               redis.call('HDEL', routesKey, routeNo)
+              -- 派生投影（规则索引）随权威 field 同一次提交清掉，不留无主记录，也不污染同编号重建
+              redis.call('HDEL', rulesKey, routeNo)
             else
               return {9, '未知路由提交类型：' .. op, 0, 0, ''}
             end
@@ -182,7 +191,7 @@ public class RouteRevisionStore {
     @SuppressWarnings("unchecked")
     private Mono<CommitResult> executeCommit(String op, String routeNo, String json, String expectVersion) {
         return redis.execute(COMMIT_SCRIPT,
-                        List.of(ROUTES_KEY, REVISION_KEY, SNAPSHOT_INDEX_KEY, CHANNEL),
+                        List.of(ROUTES_KEY, REVISION_KEY, SNAPSHOT_INDEX_KEY, CHANNEL, RULES_KEY),
                         List.of(op, routeNo, json, expectVersion, "20", Long.toString(SNAPSHOT_TTL.getSeconds())))
                 .next()
                 .map(raw -> {

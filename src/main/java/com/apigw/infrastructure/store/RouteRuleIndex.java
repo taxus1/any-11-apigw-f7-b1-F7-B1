@@ -15,10 +15,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 规则索引：把每条路由的匹配条件与转发动作单独存一份，匹配装配时以它为准，
+ * 规则索引：把每条路由的匹配条件与转发动作单独存一份投影，匹配装配时以它为准，
  * 省掉每次刷新都要把整条路由 JSON 解一遍的开销。
  *
- * <p>写入：路由创建/修改提交成功之后；读取：{@code RouteCatalog} 装配可用路由时。
+ * <p>写入：路由创建/修改提交成功之后（整份覆盖，绝不与旧内容拼接——同编号重建是全新路由，
+ * 一旦把历史投影 plus 进来，老条件老动作就会污染新路由）；读取：{@code RouteCatalog}
+ * 装配可用路由时。删除：路由删除时必须由删除链路一并清掉——revision 协调模式并入提交 Lua
+ * 与权威 field 原子 HDEL，兼容模式在同一把路由短锁内尽力 HDEL。这里只存投影，
+ * 权威数据始终是 {@code apigw:routes} 里的路由整树 JSON。
  */
 @Component
 public class RouteRuleIndex {
@@ -84,7 +88,7 @@ public class RouteRuleIndex {
             return conditions.isEmpty() && actions.isEmpty();
         }
 
-        /** 从一条路由抽出规则。 */
+        /** 从一条路由抽出规则。投影只能整份写入，不提供与历史内容拼接的入口。 */
         public static Rules of(GatewayRoute route) {
             Rules r = new Rules();
             for (GatewayRule c : route.getConditions()) {
@@ -92,18 +96,6 @@ public class RouteRuleIndex {
             }
             for (GatewayRule a : route.getActions()) {
                 r.actions.add(RuleItem.from(a));
-            }
-            return r;
-        }
-
-        /** 把另一份规则接到这一份后面。 */
-        public Rules plus(Rules other) {
-            Rules r = new Rules();
-            r.conditions.addAll(this.conditions);
-            r.actions.addAll(this.actions);
-            if (other != null) {
-                r.conditions.addAll(other.conditions);
-                r.actions.addAll(other.actions);
             }
             return r;
         }

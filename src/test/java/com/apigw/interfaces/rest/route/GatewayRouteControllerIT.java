@@ -293,10 +293,27 @@ class GatewayRouteControllerIT {
 
     @Test
     void delete_missing_returns404() {
-        web.delete().uri("/api/gateway/routes/never-existed").exchange().expectBody()
+        // 删除必须带版本；带了版本但路由不存在，仍给 404 而不是静默成功
+        web.delete().uri("/api/gateway/routes/never-existed?expectVersion=0").exchange().expectBody()
                 .jsonPath("$.code").isEqualTo(404)
                 .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
                         .contains("路由不存在，删除未执行"));
+    }
+
+    @Test
+    void delete_withoutVersion_isRejected() {
+        createRoute(routeBody("ver-01", "n", "http://h:8080", 1, null,
+                List.of(rule("PATH_PREFIX", null, "/a/", 1)), List.of())).jsonPath("$.code").isEqualTo(0);
+
+        // 不带 expectVersion：必填参数缺失，收口成 code=1（项目统一不在 HTTP 状态码上表达业务失败）
+        web.delete().uri("/api/gateway/routes/ver-01").exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("缺少必填参数"));
+
+        // 路由仍然在，编号没被释放
+        Boolean exists = redis.opsForHash().hasKey(RouteStore.ROUTES_KEY, "ver-01").block();
+        assertEquals(true, exists);
     }
 
     @Test
@@ -305,7 +322,7 @@ class GatewayRouteControllerIT {
                 List.of(rule("PATH_PREFIX", null, "/a/", 1), rule("METHOD", null, "GET", 2)),
                 List.of(rule("REQ_ADD_HEADER", "X-K", "v", 1)))).jsonPath("$.code").isEqualTo(0);
 
-        web.delete().uri("/api/gateway/routes/del-01").exchange()
+        web.delete().uri("/api/gateway/routes/del-01?expectVersion=0").exchange()
                 .expectBody().jsonPath("$.code").isEqualTo(0);
 
         // Redis 里整条 field 消失，条件/动作没有独立 key，无孤儿可留
@@ -319,7 +336,7 @@ class GatewayRouteControllerIT {
         createRoute(routeBody("re-01", "老路由", "http://order-svc:8080", 1, null,
                 List.of(rule("PATH_PREFIX", null, "/order/", 1), rule("METHOD", null, "GET", 2)),
                 List.of(rule("REQ_ADD_HEADER", "X-Legacy", "1", 1)))).jsonPath("$.code").isEqualTo(0);
-        web.delete().uri("/api/gateway/routes/re-01").exchange()
+        web.delete().uri("/api/gateway/routes/re-01?expectVersion=0").exchange()
                 .expectBody().jsonPath("$.code").isEqualTo(0);
 
         // 同编号重建：1 条件 + 1 动作，指 pay 上游

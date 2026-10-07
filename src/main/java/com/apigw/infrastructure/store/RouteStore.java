@@ -7,6 +7,7 @@ import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.RuleTypes;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -42,6 +43,7 @@ import java.util.function.Supplier;
  *
  * 这里只负责序列化与并发控制，业务规则在 {@link GatewayRoute} 聚合里。
  */
+@Slf4j
 @Component
 public class RouteStore {
 
@@ -113,14 +115,14 @@ public class RouteStore {
                         route.setVersion(0);
                         return Mono.just(route);
                     })
-                    .flatMap(saved -> syncRuleIndex(saved, true));
+                    .flatMap(this::syncRuleIndex);
         }
         return redis.opsForHash().putIfAbsent(ROUTES_KEY, route.getRouteNo(), json)
                 .flatMap(acquired -> Boolean.TRUE.equals(acquired)
                         ? Mono.just(route)
                         : Mono.error(new BizException(
                                 "路由编号已被占用（停用的路由也占号）：" + route.getRouteNo())))
-                .flatMap(saved -> syncRuleIndex(saved, true));
+                .flatMap(this::syncRuleIndex);
     }
 
     /**
@@ -161,18 +163,29 @@ public class RouteStore {
                             // id 沿用旧的，编号建后不可改；整树覆盖子项
                             route.setId(existing.getId());
                             route.setVersion(existing.getVersion() + 1);
-                            return write(route).then(syncRuleIndex(route, false));
+                            return write(route).then(syncRuleIndex(route));
                         }));
     }
 
     /**
-     * 删除：先确认存在（删不存在的不算成功，给明确结果），再 HDEL。
-     * 条件与动作跟主记录在同一个 field 里，一次 HDEL 整树清掉，不会留无主子记录。
-     * 带上 expectVersion 还能拦住「别人先改了、我手里还是旧版却来删」。
+     * 删除：必须显式带上读取时拿到的 version——和修改同一口径，防止「别人先改了、我手里还是旧版
+     * 却来删」静默丢掉别人的修改；不存在给 404，版本对不上给 409，绝不静默当成功。
+     *
+     * 条件与动作跟主记录在同一个 field 里，一次 HDEL 整树清掉；派生的规则索引投影也必须同步清：
+     * - revision 协调模式：HDEL 权威 field 与 HDEL 索引 field 在同一个 Lua 提交里原子完成，
+     *   「这边刚删、那边立刻同编号重建」不可能在两步之间捡到旧投影；
+     * - 兼容模式：同一把路由短锁内先删权威 field，再尽力删索引投影。索引投影的清理失败只记日志、
+     *   不把删除判定成失败（权威数据已经删净，孤儿投影已不参与匹配，下次同编号写入会整份覆盖它）。
+     *
+     * 留档的数据（不可变 revision 快照、访问流水）不在这里动：那是审计与多卡一致切换的依据。
      */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
+        if (expectVersion == null) {
+            return Mono.error(new BizException(
+                    "删除必须带上读取时拿到的版本号 version，用于并发冲突检测（防止删掉别人刚改过的配置）"));
+        }
         if (revisionStore != null) {
-            // 规则索引（apigw:route:rules）不在这里清：它跟着快照版本走，交回给快照轮转回收。
+            // 规则索引（apigw:route:rules）的 HDEL 已并进提交 Lua，与权威 field、快照轮转一次原子完成
             return revisionStore.commitDelete(routeNo, expectVersion)
                     .flatMap(result -> result.success()
                             ? Mono.empty()
@@ -183,11 +196,31 @@ public class RouteStore {
                         .switchIfEmpty(Mono.error(new BizException(404,
                                 "路由不存在，删除未执行：" + routeNo)))
                         .flatMap(existing -> {
-                            if (expectVersion != null && !expectVersion.equals(existing.getVersion())) {
+                            if (!expectVersion.equals(existing.getVersion())) {
                                 return Mono.error(versionConflict(existing.getVersion(), expectVersion));
                             }
-                            return redis.opsForHash().remove(ROUTES_KEY, routeNo).then();
+                            return redis.opsForHash().remove(ROUTES_KEY, routeNo)
+                                    // 派生投影的清理是「清扫」而不是删除事务的一部分：
+                                    // 它失败不能让已经成功的删除回滚成失败，孤儿投影也不影响正确性
+                                    .then(cleanRuleIndexQuietly(routeNo));
                         }));
+    }
+
+    /**
+     * 尽力清掉规则索引投影，任何失败都吞掉只留日志。
+     * 权威 field 已删，孤儿 field 不会被装配（readAll 只覆盖仍在路由集合里的编号），
+     * 同编号重建时 {@link #syncRuleIndex} 又是整份覆盖，不存在旧规则复活的路径。
+     */
+    private Mono<Void> cleanRuleIndexQuietly(String routeNo) {
+        if (ruleIndex == null) {
+            return Mono.empty();
+        }
+        return ruleIndex.remove(routeNo)
+                .onErrorResume(err -> {
+                    log.warn("删除路由 {} 后清规则索引投影失败（不影响删除结果，将由下次写入覆盖回收）：{}",
+                            routeNo, err.toString());
+                    return Mono.empty();
+                });
     }
 
     private BizException toBizException(RouteRevisionStore.CommitResult result) {
@@ -204,21 +237,18 @@ public class RouteStore {
     }
 
     /**
-     * 同步规则索引。
+     * 同步规则索引投影：永远以本份路由为基准<b>整份覆盖</b>，绝不与历史内容拼接。
      *
-     * @param reuseExisting 创建时传 true：同一个编号上如果还留着上一版的规则，接上一起用，
-     *                      免得重建之后再手工把历史规则补一遍。
+     * <p>投影的唯一真源是路由自身 JSON；「同编号重建」语义上是一条全新路由（版本归 0、id 新分配），
+     * 如果这里把旧投影 plus 进来，老路由删掉后残留在索引里的条件/动作就会冒出来跟新路由混在一起，
+     * 转发该走哪条、该加哪个头整个乱掉。删除路径见 {@link #delete} / 提交 Lua 的 HDEL rulesKey。
      */
-    private Mono<GatewayRoute> syncRuleIndex(GatewayRoute route, boolean reuseExisting) {
+    private Mono<GatewayRoute> syncRuleIndex(GatewayRoute route) {
         if (ruleIndex == null) {
             return Mono.just(route);
         }
-        Mono<RouteRuleIndex.Rules> base = reuseExisting
-                ? ruleIndex.read(route.getRouteNo()).defaultIfEmpty(new RouteRuleIndex.Rules())
-                : Mono.just(new RouteRuleIndex.Rules());
-        return base.flatMap(existing -> ruleIndex.write(route.getRouteNo(),
-                        existing.plus(RouteRuleIndex.Rules.of(route)))
-                .thenReturn(route));
+        return ruleIndex.write(route.getRouteNo(), RouteRuleIndex.Rules.of(route))
+                .thenReturn(route);
     }
 
     private Mono<Void> write(GatewayRoute route) {

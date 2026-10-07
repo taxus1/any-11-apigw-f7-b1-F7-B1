@@ -44,6 +44,7 @@ public class RouteCoordinator {
     private final ObjectMapper objectMapper;
     private final RouteCoordinationProperties properties;
     private final ActivationGate gate;
+    private final RouteRuntimeStateReaper runtimeStateReaper;
 
     private volatile RouteSnapshot current;
     private volatile Long activeRevision;
@@ -56,19 +57,35 @@ public class RouteCoordinator {
     private final Map<Long, RouteSnapshot> staged = new ConcurrentHashMap<>();
     private final AtomicLong tickGeneration = new AtomicLong();
 
+    /** 本机暂存候选快照的上界，防止协调反复中断时旧候选在进程里只增不减。 */
+    private static final int MAX_STAGED_SNAPSHOTS = 10;
+
+    @org.springframework.beans.factory.annotation.Autowired
     public RouteCoordinator(RouteRevisionStore revisionStore,
                             RouteBarrierStore barrierStore,
                             RouteStore routeStore,
                             ReactiveStringRedisTemplate redis,
                             ObjectMapper objectMapper,
-                            RouteCoordinationProperties properties) {
+                            RouteCoordinationProperties properties,
+                            RouteRuntimeStateReaper runtimeStateReaper) {
         this.revisionStore = revisionStore;
         this.barrierStore = barrierStore;
         this.routeStore = routeStore;
         this.redis = redis;
         this.objectMapper = objectMapper.findAndRegisterModules();
         this.properties = properties;
+        this.runtimeStateReaper = runtimeStateReaper;
         this.gate = new ActivationGate(properties.gateWaitTimeout());
+    }
+
+    /** 测试/兼容装配：不带运行时状态回收器时，跳过本机派生状态对账。 */
+    public RouteCoordinator(RouteRevisionStore revisionStore,
+                            RouteBarrierStore barrierStore,
+                            RouteStore routeStore,
+                            ReactiveStringRedisTemplate redis,
+                            ObjectMapper objectMapper,
+                            RouteCoordinationProperties properties) {
+        this(revisionStore, barrierStore, routeStore, redis, objectMapper, properties, null);
     }
 
     @PostConstruct
@@ -379,6 +396,11 @@ public class RouteCoordinator {
         return expected == null || Objects.equals(snapshot.checksum(), expected);
     }
 
+    /**
+     * 一份快照在本实例成为活动版本。这里是协调模式下唯一的「本机生效点」：
+     * 切换栅栏开门、换 current 之外，还按新快照对账本机派生运行时状态——被删路由名下的
+     * 熔断器/灰度计划在这一步收干净，所有实例都随各自的快照激活做同一件事。
+     */
     private void activateLocal(RouteSnapshot snapshot, String newState) {
         gate.open();
         current = snapshot;
@@ -387,7 +409,25 @@ public class RouteCoordinator {
         state = newState;
         lastError = null;
         staged.remove(snapshot.revision());
+        pruneStaged(snapshot.revision());
+        if (runtimeStateReaper != null) {
+            runtimeStateReaper.reconcile(snapshot.routes());
+        }
         safeHeartbeat();
+    }
+
+    /**
+     * staged 只该短暂持有「准备中、尚未激活」的快照。协调反复中断（某台一直没 READY 导致旧版本
+     * 卡在 PREPARING/FENCING）时，这里可能攒下一串再也不会激活的快照；以当前激活版本为界，
+     * 只保留比它新的少量候选，旧的全部丢弃（Redis 里的不可变快照不受影响，需要时可重新装载）。
+     */
+    private void pruneStaged(long activeRev) {
+        staged.keySet().removeIf(rev -> rev <= activeRev);
+        if (staged.size() <= MAX_STAGED_SNAPSHOTS) {
+            return;
+        }
+        staged.keySet().stream().sorted().limit(staged.size() - MAX_STAGED_SNAPSHOTS)
+                .forEach(staged::remove);
     }
 
     private void onChannelMessage(String message) {

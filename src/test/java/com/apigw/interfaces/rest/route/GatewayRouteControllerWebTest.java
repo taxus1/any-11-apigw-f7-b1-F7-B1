@@ -20,6 +20,8 @@ import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -225,10 +227,20 @@ class GatewayRouteControllerWebTest {
     }
 
     @Test
+    void delete_withoutVersion_rejectedAtBinding() {
+        // expectVersion 是必填 query 参数：缺失时由全局异常处理收口成 code=1，不进 store
+        web.delete().uri("/api/gateway/routes/ghost").exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("缺少必填参数"));
+        verify(store, never()).delete(any(), any());
+    }
+
+    @Test
     void delete_missing_returns404_notSilentSuccess() {
         when(store.delete(any(), any())).thenReturn(Mono.error(
                 new BizException(404, "路由不存在，删除未执行：ghost")));
-        web.delete().uri("/api/gateway/routes/ghost").exchange().expectBody()
+        web.delete().uri("/api/gateway/routes/ghost?expectVersion=3").exchange().expectBody()
                 .jsonPath("$.code").isEqualTo(404)
                 .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
                         .contains("删除未执行"));

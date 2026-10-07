@@ -32,6 +32,7 @@ public class RouteCatalog {
     private final Duration ttl;
     private final RouteCoordinator coordinator;
     private final RouteRuleIndex ruleIndex;
+    private final RouteRuntimeStateReaper runtimeStateReaper;
 
     private volatile Snapshot snapshot;
     private Mono<List<GatewayRoute>> inflight;
@@ -40,21 +41,23 @@ public class RouteCatalog {
     public RouteCatalog(RouteStore routeStore,
                         GatewayProxyProperties properties,
                         RouteCoordinator coordinator,
-                        RouteRuleIndex ruleIndex) {
+                        RouteRuleIndex ruleIndex,
+                        RouteRuntimeStateReaper runtimeStateReaper) {
         this.routeStore = routeStore;
         this.ttl = properties.routeRefreshInterval().multipliedBy(3);
         this.coordinator = coordinator;
         this.ruleIndex = ruleIndex;
+        this.runtimeStateReaper = runtimeStateReaper;
     }
 
     /** 单元测试/关闭协调时使用的兼容构造器。 */
     public RouteCatalog(RouteStore routeStore, GatewayProxyProperties properties,
                         RouteCoordinator coordinator) {
-        this(routeStore, properties, coordinator, null);
+        this(routeStore, properties, coordinator, null, null);
     }
 
     public RouteCatalog(RouteStore routeStore, GatewayProxyProperties properties) {
-        this(routeStore, properties, null, null);
+        this(routeStore, properties, null, null, null);
     }
 
     public Mono<RouteSnapshot> snapshot() {
@@ -152,10 +155,19 @@ public class RouteCatalog {
                 err -> log.warn("路由快照预热失败（Redis 未就绪？），将在有请求时重试：{}", err.toString()));
     }
 
-    /** 强制拉一份新快照；失败保留旧快照。 */
+    /**
+     * 强制拉一份新快照；失败保留旧快照。
+     * 兼容模式下新快照到手即按它对账本机派生运行时状态（协调模式由
+     * {@link RouteCoordinator} 在统一激活点对账，这里不重复做）。
+     */
     public Mono<List<GatewayRoute>> refresh() {
         return load()
-                .doOnNext(list -> this.snapshot = new Snapshot(List.copyOf(list), System.currentTimeMillis()));
+                .doOnNext(list -> {
+                    this.snapshot = new Snapshot(List.copyOf(list), System.currentTimeMillis());
+                    if (runtimeStateReaper != null && !coordinatorEnabled()) {
+                        runtimeStateReaper.reconcile(list);
+                    }
+                });
     }
 
     /**

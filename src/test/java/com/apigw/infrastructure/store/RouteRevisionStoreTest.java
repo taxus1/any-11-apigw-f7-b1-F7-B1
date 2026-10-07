@@ -101,6 +101,41 @@ class RouteRevisionStoreTest {
     }
 
     @Test
+    void commitDelete_withoutVersion_isRejectedBeforeTouchingRevision() {
+        store.create(route("order-rev-4", 0)).block();
+        BizException error = assertThrows(BizException.class,
+                () -> store.delete("order-rev-4", null).block());
+        assertTrue(error.getMessage().contains("删除必须带上读取时拿到的版本号"));
+        // 删除被拒，revision 不前进，路由还在
+        assertEquals(1L, revisions.latestRevision().block());
+        assertTrue(store.findByRouteNo("order-rev-4").block() != null);
+    }
+
+    @Test
+    void commitDelete_atomicallyRemovesRuleIndexProjection() {
+        RouteRuleIndex ruleIndex = new RouteRuleIndex(redis, new ObjectMapper());
+        RouteStore indexedStore = new RouteStore(redis, new ObjectMapper(), revisions, ruleIndex);
+
+        indexedStore.create(route("order-rev-5", 0)).block();
+        assertEquals(1, ruleIndex.read("order-rev-5").block().conditions.size());
+
+        indexedStore.delete("order-rev-5", 0).block();
+
+        // 权威 field 与派生投影同一次 Lua 提交清掉，不存在无主记录，也不会污染同编号重建
+        StepVerifier.create(ruleIndex.read("order-rev-5")).verifyComplete();
+        StepVerifier.create(indexedStore.findByRouteNo("order-rev-5")).verifyComplete();
+
+        // 立刻同编号重建：投影只有新规则，老规则不会冒出来
+        GatewayRoute fresh = route("order-rev-5", 0);
+        fresh.replaceRules(
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/new/", 1)),
+                List.of());
+        indexedStore.create(fresh).block();
+        assertEquals(1, ruleIndex.read("order-rev-5").block().conditions.size());
+        assertEquals("/new/", ruleIndex.read("order-rev-5").block().conditions.get(0).value);
+    }
+
+    @Test
     void commitUpdate_staleVersionDoesNotAdvanceRevision() {
         store.create(route("order-rev-3", 0)).block();
         GatewayRoute first = route("order-rev-3", 0);

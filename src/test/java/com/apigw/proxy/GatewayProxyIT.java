@@ -141,7 +141,7 @@ class GatewayProxyIT {
                 .expectBody().jsonPath("$.error").isEqualTo("NO_ROUTE");
 
         // 4. 删除路由后立刻失效（同样不重启）
-        web.delete().uri("/api/gateway/routes/it-order").exchange()
+        web.delete().uri("/api/gateway/routes/it-order?expectVersion=0").exchange()
                 .expectStatus().isOk().expectBody().jsonPath("$.code").isEqualTo(0);
         web.get().uri("/order/it").exchange()
                 .expectStatus().isNotFound()

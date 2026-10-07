@@ -8,6 +8,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 灰度分流的运行时入口：匹配到路由之后、转发之前，由它决定这笔请求打哪个上游。
@@ -32,7 +33,8 @@ import java.util.Map;
  * - 快照 10s 兜底重载出来的是同版本的新对象 → 复用同一计划，轮询计数器不被重置
  *   （低流量下若每次重载都清零，10s 只有一两个请求时小权重组会永远选不上）；
  * - 权重/标记/上游一改、版本一变 → 立刻编译新计划，不存在「结果缓死、改了迟迟不生效」。
- * 缓存有界（{@link #MAX_PLANS}，access-order LRU），路由被删后其计划不再被访问，自然淘汰。
+ * 缓存有界（{@link #MAX_PLANS}，access-order LRU）；但删除不能只等 LRU——同编号重建版本从 0
+ * 重新计，旧计划会被新路由误认成同版本，所以路由删除/快照切换时由对账逻辑显式摘除。
  */
 @Component
 public class GrayReleaseSelector {
@@ -90,8 +92,35 @@ public class GrayReleaseSelector {
     }
 
     /** 缓存可见的诊断：当前驻留的计划数（测试/监控用）。 */
-    int cachedPlanCount() {
+    public int cachedPlanCount() {
         return plans.size();
+    }
+
+    /**
+     * 路由删除时显式摘除它的编译计划。
+     *
+     * <p>不能只依赖 LRU 惰性淘汰：删除后同编号重建是一条版本仍从 0 起算的全新路由，
+     * 缓存键是编号、新鲜度只比版本号，若不摘除，新路由在首次更新前会直接复用上一任的分流计划，
+     * 把灰度流量按老分组/老权重/老上游分走。
+     */
+    public void evict(String routeNo) {
+        plans.remove(routeNo);
+    }
+
+    /**
+     * 快照切换后的对账：只保留当前生效快照里确实配了灰度分组的路由计划，
+     * 删除、停用灰度、还没激活到本实例的路由计划一律摘掉，缓存不随历史只增不减。
+     */
+    public void reconcileTo(List<GatewayRoute> liveRoutes) {
+        Set<String> live = new java.util.HashSet<>();
+        if (liveRoutes != null) {
+            for (GatewayRoute r : liveRoutes) {
+                if (r.hasGrayGroups()) {
+                    live.add(r.getRouteNo());
+                }
+            }
+        }
+        plans.keySet().retainAll(live);
     }
 
     private record CachedPlan(int version, GrayPlan plan) {

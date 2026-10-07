@@ -232,4 +232,39 @@ class GrayReleaseSelectorTest {
                 .header("X-Canary", "v2").build();
         assertThat(s.select(r, req).groupName()).isEqualTo("canary");
     }
+
+    @Test
+    void evictAfterDelete_thenRecreateAtVersion0_doesNotReuseLegacyPlan() {
+        // 老路由：canary 权重 0，且认领标记 v2
+        GatewayRoute legacy = route(0, List.of(
+                g("stable", "stable", 100), g("canary", "canary", 0, "v2")));
+        selector.select(legacy, request("v2"));
+        assertThat(selector.cachedPlanCount()).isEqualTo(1);
+
+        // 删除：显式摘除计划
+        selector.evict("gray-r");
+        assertThat(selector.cachedPlanCount()).isEqualTo(0);
+
+        // 同编号重建，版本仍从 0 起算，但分组完全不同（不再有任何组认领 v2）
+        GatewayRoute recreated = route(0, List.of(g("blue", "blue", 100)));
+        GrayTarget target = selector.select(recreated, request("v2"));
+        // 若错误复用了老计划，带 v2 标记会被分到一个已经不存在的 canary 组
+        assertThat(target.groupName()).isEqualTo("blue");
+        assertThat(target.byTag()).isFalse();
+    }
+
+    @Test
+    void reconcileTo_keepsOnlyPlansOfRoutesStillActiveWithGrayGroups() {
+        selector.select(route(0, List.of(g("stable", "a", 100))), request(null));
+
+        GatewayRoute other = GatewayRoute.create("gray-other", "灰度", "http://b:8080", 1, null);
+        other.setVersion(0);
+        other.replaceGrayGroups(List.of(g("stable", "b", 100)));
+        selector.select(other, request(null));
+        assertThat(selector.cachedPlanCount()).isEqualTo(2);
+
+        // 新快照：gray-r 已删除，gray-other 还在但关掉了灰度
+        selector.reconcileTo(List.of(GatewayRoute.create("gray-other", "灰度", "http://b:8080", 1, null)));
+        assertThat(selector.cachedPlanCount()).isZero();
+    }
 }

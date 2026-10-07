@@ -72,7 +72,11 @@ public class GatewayRouteAppService {
                 .switchIfEmpty(Mono.error(new BizException(404, "路由不存在：" + routeNo)));
     }
 
-    /** 删除：不存在、版本旧了都会拿到明确的失败结果，绝不静默当成功。 */
+    /**
+     * 删除：必须显式带上读取时拿到的版本号。不存在给 404、版本旧了给 409，绝不静默当成功；
+     * 版本对不上不许删，防止把别人刚提交的修改连同旧版一起抹掉。
+     * 停用的路由仍然占号，只有删除成功才释放编号（同编号再建才是一条全新路由）。
+     */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
         return routeStore.delete(routeNo, expectVersion)
                 .doOnSuccess(v -> eventPublisher.publishEvent(RoutesChangedEvent.deleted(routeNo)));

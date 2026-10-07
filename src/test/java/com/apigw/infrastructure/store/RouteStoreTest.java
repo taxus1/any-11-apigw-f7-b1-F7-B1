@@ -220,8 +220,21 @@ class RouteStoreTest {
     }
 
     @Test
+    void delete_withoutVersion_isRejected() {
+        store.create(route("order-08", 0)).block();
+        StepVerifier.create(store.delete("order-08", null))
+                .expectErrorSatisfies(e -> {
+                    assertTrue(e instanceof BizException);
+                    assertTrue(e.getMessage().contains("删除必须带上读取时拿到的版本号"), e.getMessage());
+                })
+                .verify();
+        // 被拒的删除不能真的删掉
+        assertNotNull(store.findByRouteNo("order-08").block());
+    }
+
+    @Test
     void delete_notExists_reports404_notSilentSuccess() {
-        StepVerifier.create(store.delete("ghost", null))
+        StepVerifier.create(store.delete("ghost", 0))
                 .expectErrorSatisfies(e -> {
                     assertTrue(e instanceof BizException);
                     assertEquals(404, ((BizException) e).getCode());
@@ -240,5 +253,45 @@ class RouteStoreTest {
                 .verify();
         // 没删掉
         assertNotNull(store.findByRouteNo("order-07").block());
+    }
+
+    @Test
+    void delete_cleansRuleIndexProjection_andRecreateOverwritesInsteadOfMerging() {
+        // 装配一个带规则索引投影的 store，直接复现「删除后条件/动作还挂在存储里」的事故链路
+        RouteRuleIndex index = new RouteRuleIndex(redis, new ObjectMapper());
+        RouteStore indexedStore = new RouteStore(redis, new ObjectMapper(), null, index);
+
+        indexedStore.create(route("idx-01", 0)).block();
+        // 删除前投影确实在
+        assertEquals(2, index.read("idx-01").block().conditions.size());
+
+        indexedStore.delete("idx-01", 0).block();
+
+        // 权威 field 与派生投影都必须消失，存储里没有无主记录
+        StepVerifier.create(indexedStore.findByRouteNo("idx-01")).verifyComplete();
+        StepVerifier.create(index.read("idx-01")).verifyComplete();
+    }
+
+    @Test
+    void recreateSameRouteNo_ruleIndexHasOnlyNewRules_notMergedWithLegacy() {
+        RouteRuleIndex index = new RouteRuleIndex(redis, new ObjectMapper());
+        RouteStore indexedStore = new RouteStore(redis, new ObjectMapper(), null, index);
+
+        indexedStore.create(route("idx-02", 0)).block();
+        indexedStore.delete("idx-02", 0).block();
+
+        // 同编号重建：只有 1 条件 + 1 动作
+        GatewayRoute fresh = GatewayRoute.create("idx-02", "重建", "http://pay-svc:9090", 1, null);
+        fresh.replaceRules(
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/pay/", 1)),
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_REQ_REMOVE_HEADER, "X-Old", null, 1)));
+        indexedStore.create(fresh).block();
+
+        // 投影里只能有新路由这一批，老的 2 条件 2 动作一个都不许冒出来
+        RouteRuleIndex.Rules projected = index.read("idx-02").block();
+        assertEquals(1, projected.conditions.size());
+        assertEquals("/pay/", projected.conditions.get(0).value);
+        assertEquals(1, projected.actions.size());
+        assertEquals("X-Old", projected.actions.get(0).name);
     }
 }
