@@ -20,6 +20,7 @@ import reactor.test.StepVerifier;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -190,6 +191,19 @@ class RouteStoreTest {
     }
 
     @Test
+    void delete_withoutVersion_isRejected() {
+        store.create(route("order-08", 0)).block();
+        StepVerifier.create(store.delete("order-08", null))
+                .expectErrorSatisfies(e -> {
+                    assertTrue(e instanceof BizException);
+                    assertTrue(e.getMessage().contains("删除必须带上读取时拿到的版本号"), e.getMessage());
+                })
+                .verify();
+        // 被拒的删除不能真删
+        assertNotNull(store.findByRouteNo("order-08").block());
+    }
+
+    @Test
     void delete_thenRecreateSameRouteNo_startsClean_noLeftoverChildren() {
         // 老路由：2 条件 + 2 动作
         GatewayRoute old = route("re-01", 0);
@@ -199,11 +213,13 @@ class RouteStoreTest {
 
         // 同编号重建：只带 1 条件 + 1 动作，内容完全不同
         GatewayRoute fresh = GatewayRoute.create("re-01", "重建", "http://pay-svc:9090", 1, null);
-        fresh.setId("new-id-re-01");
+        // id 不接受客户端指定：create 统一由服务端重新分配，保证新一代与老路由属主不同
+        String clientGivenId = "new-id-re-01";
+        fresh.setId(clientGivenId);
         fresh.replaceRules(
                 List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/pay/", 1)),
                 List.of(GatewayRule.create(null, RuleTypes.TYPE_REQ_REMOVE_HEADER, "X-Old", null, 1)));
-        store.create(fresh).block();
+        GatewayRoute saved = store.create(fresh).block();
 
         GatewayRoute got = store.findByRouteNo("re-01").block();
         assertNotNull(got);
@@ -213,15 +229,16 @@ class RouteStoreTest {
         assertEquals(1, got.getActions().size());
         assertEquals("X-Old", got.getActions().get(0).getName());
         assertEquals("http://pay-svc:9090", got.getUpstream());
-        // 版本从 0 重新计，id 是新分配的那个，与老路由没有任何瓜葛
+        // 版本从 0 重新计；id 是服务端分配的新值，既不等于老路由，也不理会客户端自带的那个
         assertEquals(0, got.getVersion());
-        assertEquals("new-id-re-01", got.getId());
+        assertNotEquals(clientGivenId, got.getId());
+        assertEquals(saved.getId(), got.getId());
         assertTrue(oldId == null || !oldId.equals(got.getId()));
     }
 
     @Test
     void delete_notExists_reports404_notSilentSuccess() {
-        StepVerifier.create(store.delete("ghost", null))
+        StepVerifier.create(store.delete("ghost", 0))
                 .expectErrorSatisfies(e -> {
                     assertTrue(e instanceof BizException);
                     assertEquals(404, ((BizException) e).getCode());

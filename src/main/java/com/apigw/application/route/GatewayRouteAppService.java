@@ -72,8 +72,19 @@ public class GatewayRouteAppService {
                 .switchIfEmpty(Mono.error(new BizException(404, "路由不存在：" + routeNo)));
     }
 
-    /** 删除：不存在、版本旧了都会拿到明确的失败结果，绝不静默当成功。 */
+    /**
+     * 删除：删除也走乐观锁——必须带上详情里拿到的 version，版本旧了给 409，不存在给 404，
+     * 绝不静默当成功；停用不释放编号，只有删除才释放（编号占用在 store 原子判定）。
+     *
+     * <p>派生状态（规则索引等）在 store 提交成功后 best-effort 清理：清理失败不影响删除结果，
+     * 残留由转发侧周期对账兜底，确保存储里不留无主记录。
+     */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
+        if (expectVersion == null) {
+            return Mono.error(new BizException(
+                    "删除必须带上路由当前版本号 expectVersion（与修改同一套乐观锁），"
+                            + "防止拿着旧页面误删别人刚改过的配置"));
+        }
         return routeStore.delete(routeNo, expectVersion)
                 .doOnSuccess(v -> eventPublisher.publishEvent(RoutesChangedEvent.deleted(routeNo)));
     }

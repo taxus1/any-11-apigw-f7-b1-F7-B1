@@ -165,6 +165,31 @@ public class RouteRevisionStore {
                 .defaultIfEmpty(0L);
     }
 
+    /**
+     * 仍在快照保留窗口里的 revision 集合（{@code apigw:route:snapshot:index} 的成员）。
+     * 屏障回收时跳过这些：它们可能还要用于状态查询或实例短暂落后时的追赶。
+     */
+    public Mono<java.util.Set<Long>> retainedRevisions() {
+        // zset 成员就是 revision 字符串、分数即 revision；只保留最近 20 个，规模很小，全取即可。
+        // 排名区间下界 0、上界不限（spring-data-redis 会把无上界翻译成 Redis 的 -1）。
+        org.springframework.data.domain.Range<Long> allRanks =
+                org.springframework.data.domain.Range.from(
+                                org.springframework.data.domain.Range.Bound.inclusive(0L))
+                        .to(org.springframework.data.domain.Range.Bound.unbounded());
+        return redis.opsForZSet()
+                .range(SNAPSHOT_INDEX_KEY, allRanks)
+                .map(v -> {
+                    try {
+                        return Long.valueOf(v.toString());
+                    } catch (NumberFormatException e) {
+                        // 索引里出现非数字成员属于脏数据，跳过即可，不影响回收
+                        return null;
+                    }
+                })
+                .filter(java.util.Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
     public Mono<Map<String, String>> loadSnapshot(long revision) {
         return redis.opsForHash().entries(SNAPSHOT_PREFIX + revision)
                 .collectMap(e -> e.getKey().toString(), e -> e.getValue().toString());

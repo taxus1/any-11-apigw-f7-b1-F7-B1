@@ -4,6 +4,7 @@ import com.apigw.domain.route.GatewayRoute;
 import com.apigw.infrastructure.store.RouteRuleIndex;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.proxy.config.GatewayProxyProperties;
+import com.apigw.proxy.resilience.CircuitBreakerRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -32,6 +33,13 @@ public class RouteCatalog {
     private final Duration ttl;
     private final RouteCoordinator coordinator;
     private final RouteRuleIndex ruleIndex;
+
+    /**
+     * 本机熔断器登记表是路由派生的运行时状态：协调模式由 {@link RouteCoordinator} 在快照激活后对账，
+     * 单机模式由本目录在刷新后对账。用可选注入，保持单测里的轻量构造器不变。
+     */
+    @Autowired(required = false)
+    private CircuitBreakerRegistry breakerRegistry;
 
     private volatile Snapshot snapshot;
     private Mono<List<GatewayRoute>> inflight;
@@ -141,6 +149,28 @@ public class RouteCatalog {
                 err -> log.debug("路由快照定时刷新失败，沿用上一份快照：{}", err.toString()));
     }
 
+    /**
+     * 单机模式下定期对账规则索引：权威路由已经删除、索引 field 却因当次清理失败而残留的，
+     * 在这里按属主核对后收掉。它是「删除 best-effort 清理」之外的兜底，保证索引不越删越胀。
+     * 协调模式不需要：转发走 revision 快照、不读索引，屏障/快照由协调器自行回收。
+     */
+    @Scheduled(fixedDelayString = "${apigw.proxy.rule-index-reconcile-interval-ms:60000}")
+    public void reconcileRuleIndex() {
+        if (coordinator != null && coordinatorEnabled() || ruleIndex == null) {
+            return;
+        }
+        ruleIndex.reconcile()
+                .onErrorResume(err -> {
+                    log.warn("规则索引孤儿对账失败，下轮再试：{}", err.toString());
+                    return Mono.just(0L);
+                })
+                .subscribe(removed -> {
+                    if (removed > 0) {
+                        log.info("规则索引对账回收 {} 条已删路由的无主记录", removed);
+                    }
+                });
+    }
+
     /** 启动就绪后先拉一次；协调器自己的订阅/心跳在 PostConstruct 启动。 */
     @EventListener(ApplicationReadyEvent.class)
     public void warmUp() {
@@ -152,10 +182,41 @@ public class RouteCatalog {
                 err -> log.warn("路由快照预热失败（Redis 未就绪？），将在有请求时重试：{}", err.toString()));
     }
 
-    /** 强制拉一份新快照；失败保留旧快照。 */
+    /**
+     * 强制拉一份新快照；失败保留旧快照。
+     * 成功换上新快照后，回收本机里已从配置集合消失的派生熔断器。
+     */
     public Mono<List<GatewayRoute>> refresh() {
         return load()
-                .doOnNext(list -> this.snapshot = new Snapshot(List.copyOf(list), System.currentTimeMillis()));
+                .doOnNext(list -> {
+                    this.snapshot = new Snapshot(List.copyOf(list), System.currentTimeMillis());
+                    pruneBreakers();
+                });
+    }
+
+    /**
+     * 按当前全量权威路由对账本机熔断器（删除的路由、取消熔断的条目都收走）。
+     * 必须拿<b>全量</b>（含停用/无条件的）路由来判断「配置里是否还有」，不能只拿可用快照，
+     * 否则一条临时停用的路由会被误当成已删除。纯内存、失败不影响转发。
+     */
+    private void pruneBreakers() {
+        if (breakerRegistry == null) {
+            return;
+        }
+        routeStore.findAll()
+                .collectList()
+                .subscribe(all -> {
+                    try {
+                        breakerRegistry.pruneAbsent(all);
+                    } catch (Exception e) {
+                        log.debug("熔断器快照对账失败（不影响转发）：{}", e.toString());
+                    }
+                }, err -> log.debug("熔断器对账读取全量路由失败，跳过本轮：{}", err.toString()));
+    }
+
+    /** 测试装配：注入本机熔断器登记表。 */
+    public void setBreakerRegistry(CircuitBreakerRegistry breakerRegistry) {
+        this.breakerRegistry = breakerRegistry;
     }
 
     /**

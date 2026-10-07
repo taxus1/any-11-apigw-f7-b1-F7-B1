@@ -45,6 +45,7 @@ class GatewayRouteControllerIT {
     @BeforeEach
     void clean() {
         redis.delete(RouteStore.ROUTES_KEY).block();
+        redis.delete("apigw:route:rules").block();
         redis.scan(org.springframework.data.redis.core.ScanOptions
                         .scanOptions().match("apigw:lock:route:*").build())
                 .collectList()
@@ -293,24 +294,67 @@ class GatewayRouteControllerIT {
 
     @Test
     void delete_missing_returns404() {
-        web.delete().uri("/api/gateway/routes/never-existed").exchange().expectBody()
+        web.delete().uri("/api/gateway/routes/never-existed?expectVersion=0").exchange().expectBody()
                 .jsonPath("$.code").isEqualTo(404)
                 .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
                         .contains("路由不存在，删除未执行"));
     }
 
     @Test
-    void delete_cascadesWholeTree() {
+    void delete_withoutVersion_isRejected_andRouteKept() {
+        createRoute(routeBody("del-nover", "n", "http://h:8080", 1, null,
+                List.of(rule("PATH_PREFIX", null, "/a/", 1)),
+                List.of())).jsonPath("$.code").isEqualTo(0);
+
+        // 不带版本不许删：显式业务失败，而不是当成功
+        web.delete().uri("/api/gateway/routes/del-nover").exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("必须带上路由当前版本号"));
+
+        Boolean exists = redis.opsForHash().hasKey(RouteStore.ROUTES_KEY, "del-nover").block();
+        assertEquals(true, exists, "被拒绝的删除不能真的删掉路由");
+    }
+
+    @Test
+    void delete_staleVersion_isRejected() {
+        createRoute(routeBody("del-stale", "n", "http://h:8080", 1, null,
+                List.of(rule("PATH_PREFIX", null, "/a/", 1)),
+                List.of())).jsonPath("$.code").isEqualTo(0);
+        Map<String, Object> upd = routeBody("del-stale", "n2", "http://h:8080", 1, null,
+                List.of(rule("PATH_PREFIX", null, "/b/", 1)),
+                List.of());
+        upd.put("version", 0);
+        web.put().uri("/api/gateway/routes/del-stale").bodyValue(upd).exchange()
+                .expectBody().jsonPath("$.code").isEqualTo(0);
+
+        // 版本已到 1，还拿 0 来删：409，路由保留
+        web.delete().uri("/api/gateway/routes/del-stale?expectVersion=0").exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(409)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("你这份配置已经旧了"));
+        Boolean exists = redis.opsForHash().hasKey(RouteStore.ROUTES_KEY, "del-stale").block();
+        assertEquals(true, exists);
+    }
+
+    @Test
+    void delete_cascadesWholeTree_andRuleIndex() {
         createRoute(routeBody("del-01", "n", "http://h:8080", 1, null,
                 List.of(rule("PATH_PREFIX", null, "/a/", 1), rule("METHOD", null, "GET", 2)),
                 List.of(rule("REQ_ADD_HEADER", "X-K", "v", 1)))).jsonPath("$.code").isEqualTo(0);
 
-        web.delete().uri("/api/gateway/routes/del-01").exchange()
+        // 规则索引在创建后应有一份
+        Object indexed = redis.opsForHash().get("apigw:route:rules", "del-01").block();
+        assertEquals(true, indexed != null);
+
+        web.delete().uri("/api/gateway/routes/del-01?expectVersion=0").exchange()
                 .expectBody().jsonPath("$.code").isEqualTo(0);
 
-        // Redis 里整条 field 消失，条件/动作没有独立 key，无孤儿可留
+        // Redis 里整条 field 消失，条件/动作没有独立 key；规则索引 field 也一并收掉，无孤儿
         Boolean exists = redis.opsForHash().hasKey(RouteStore.ROUTES_KEY, "del-01").block();
         assertEquals(false, exists);
+        Boolean indexExists = redis.opsForHash().hasKey("apigw:route:rules", "del-01").block();
+        assertEquals(false, indexExists, "删除后规则索引不能留下无主 field");
     }
 
     @Test
@@ -319,7 +363,7 @@ class GatewayRouteControllerIT {
         createRoute(routeBody("re-01", "老路由", "http://order-svc:8080", 1, null,
                 List.of(rule("PATH_PREFIX", null, "/order/", 1), rule("METHOD", null, "GET", 2)),
                 List.of(rule("REQ_ADD_HEADER", "X-Legacy", "1", 1)))).jsonPath("$.code").isEqualTo(0);
-        web.delete().uri("/api/gateway/routes/re-01").exchange()
+        web.delete().uri("/api/gateway/routes/re-01?expectVersion=0").exchange()
                 .expectBody().jsonPath("$.code").isEqualTo(0);
 
         // 同编号重建：1 条件 + 1 动作，指 pay 上游
@@ -337,5 +381,11 @@ class GatewayRouteControllerIT {
                 .jsonPath("$.data.conditions[0].value").isEqualTo("/pay/")
                 .jsonPath("$.data.actions.length()").isEqualTo(1)
                 .jsonPath("$.data.actions[0].type").isEqualTo("REQ_REMOVE_HEADER");
+
+        // 规则索引同样只有新那一批：老条件/老动作不许残留在索引里被装配捡到
+        String indexJson = String.valueOf(
+                redis.opsForHash().get("apigw:route:rules", "re-01").block());
+        org.assertj.core.api.Assertions.assertThat(indexJson)
+                .contains("/pay/").doesNotContain("/order/").doesNotContain("X-Legacy");
     }
 }

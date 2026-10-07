@@ -5,6 +5,7 @@ import com.apigw.domain.route.GatewayRoute;
 import com.apigw.infrastructure.store.RouteBarrierStore;
 import com.apigw.infrastructure.store.RouteRevisionStore;
 import com.apigw.infrastructure.store.RouteStore;
+import com.apigw.proxy.resilience.CircuitBreakerRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -44,6 +45,7 @@ public class RouteCoordinator {
     private final ObjectMapper objectMapper;
     private final RouteCoordinationProperties properties;
     private final ActivationGate gate;
+    private final CircuitBreakerRegistry breakerRegistry;
 
     private volatile RouteSnapshot current;
     private volatile Long activeRevision;
@@ -62,6 +64,18 @@ public class RouteCoordinator {
                             ReactiveStringRedisTemplate redis,
                             ObjectMapper objectMapper,
                             RouteCoordinationProperties properties) {
+        this(revisionStore, barrierStore, routeStore, redis, objectMapper, properties,
+                new CircuitBreakerRegistry());
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RouteCoordinator(RouteRevisionStore revisionStore,
+                            RouteBarrierStore barrierStore,
+                            RouteStore routeStore,
+                            ReactiveStringRedisTemplate redis,
+                            ObjectMapper objectMapper,
+                            RouteCoordinationProperties properties,
+                            CircuitBreakerRegistry breakerRegistry) {
         this.revisionStore = revisionStore;
         this.barrierStore = barrierStore;
         this.routeStore = routeStore;
@@ -69,6 +83,7 @@ public class RouteCoordinator {
         this.objectMapper = objectMapper.findAndRegisterModules();
         this.properties = properties;
         this.gate = new ActivationGate(properties.gateWaitTimeout());
+        this.breakerRegistry = breakerRegistry;
     }
 
     @PostConstruct
@@ -88,6 +103,11 @@ public class RouteCoordinator {
         Schedulers.parallel().schedulePeriodically(this::safeHeartbeat,
                 0,
                 properties.heartbeatInterval().toMillis(),
+                java.util.concurrent.TimeUnit.MILLISECONDS);
+        // 协调运行时状态（屏障 key）周期回收：删除/失败的 revision 不留永久残留。
+        Schedulers.parallel().schedulePeriodically(this::safePruneBarriers,
+                properties.pollInterval().toMillis() * 10,
+                properties.pollInterval().toMillis() * 30,
                 java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
@@ -381,12 +401,26 @@ public class RouteCoordinator {
 
     private void activateLocal(RouteSnapshot snapshot, String newState) {
         gate.open();
+        RouteSnapshot previous = this.current;
         current = snapshot;
         activeRevision = snapshot.revision();
         latestRevision = Math.max(latestRevision, snapshot.revision());
         state = newState;
         lastError = null;
         staged.remove(snapshot.revision());
+        // 新快照生效后，收掉本进程里已经从配置集合消失的派生熔断器
+        // （删路由 / 去掉某灰度上游）。首份快照（previous == null）无需对账。
+        if (previous == null || previous.revision() != snapshot.revision()) {
+            try {
+                int pruned = breakerRegistry.pruneAbsent(snapshot.routes());
+                if (pruned > 0) {
+                    log.info("路由快照切换到 revision={}，回收 {} 个已消失路由的本机熔断器",
+                            snapshot.revision(), pruned);
+                }
+            } catch (Exception e) {
+                log.debug("熔断器快照对账失败（不影响转发）：{}", e.toString());
+            }
+        }
         safeHeartbeat();
     }
 
@@ -440,6 +474,32 @@ public class RouteCoordinator {
 
     private void safeHeartbeat() {
         writeHeartbeat().subscribe();
+    }
+
+    /**
+     * 回收陈旧屏障 key（运行时状态，非留档）。只在本机持有较新快照、状态明确时做，
+     * 任何失败都不影响协调与转发；TTL 是它之外的第二道兜底。
+     */
+    private void safePruneBarriers() {
+        try {
+            Long active = activeRevision;
+            if (active == null || active <= 0) {
+                return;
+            }
+            revisionStore.retainedRevisions()
+                    .flatMap(keep -> barrierStore.pruneSettledBefore(active, keep))
+                    .onErrorResume(err -> {
+                        log.debug("陈旧路由屏障回收失败（有 TTL 兜底）：{}", err.toString());
+                        return Mono.empty();
+                    })
+                    .subscribe(removed -> {
+                        if (removed > 0) {
+                            log.debug("回收 {} 个已尘埃落定的旧路由屏障 key", removed);
+                        }
+                    });
+        } catch (Exception e) {
+            log.debug("触发路由屏障回收失败：{}", e.toString());
+        }
     }
 
     private Mono<List<InstanceStatus>> instances(long latest) {

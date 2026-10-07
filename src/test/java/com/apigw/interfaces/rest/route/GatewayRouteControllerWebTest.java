@@ -217,6 +217,18 @@ class GatewayRouteControllerWebTest {
     }
 
     @Test
+    void delete_withoutVersion_rejectedBeforeTouchingStore() {
+        // 删除与修改同一套乐观锁：没带 expectVersion 在进应用服务前就被必填参数校验拦下，
+        // store.delete 一次都不该调
+        web.delete().uri("/api/gateway/routes/order-01")
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("缺少必填参数").contains("expectVersion"));
+        org.mockito.Mockito.verifyNoInteractions(store);
+    }
+
+    @Test
     void detail_missing_returns404() {
         when(store.findByRouteNo("ghost")).thenReturn(Mono.empty());
         web.get().uri("/api/gateway/routes/ghost").exchange().expectBody()
@@ -228,7 +240,7 @@ class GatewayRouteControllerWebTest {
     void delete_missing_returns404_notSilentSuccess() {
         when(store.delete(any(), any())).thenReturn(Mono.error(
                 new BizException(404, "路由不存在，删除未执行：ghost")));
-        web.delete().uri("/api/gateway/routes/ghost").exchange().expectBody()
+        web.delete().uri("/api/gateway/routes/ghost?expectVersion=0").exchange().expectBody()
                 .jsonPath("$.code").isEqualTo(404)
                 .jsonPath("$.msg").value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
                         .contains("删除未执行"));

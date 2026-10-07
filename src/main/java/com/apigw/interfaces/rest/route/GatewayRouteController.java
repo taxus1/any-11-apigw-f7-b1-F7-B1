@@ -79,11 +79,12 @@ public class GatewayRouteController {
 
     /**
      * 删除路由。
-     * expectVersion 可选：带上它就能拦住「别人先改了、我还在删旧版」的情况。
+     * expectVersion 必填：和修改同一套乐观锁——必须先读详情拿到当前版本，
+     * 别人在你读取后改过，删除会被 409 拦下，避免拿着旧页面把新版本误删掉。
      */
     @DeleteMapping("/{routeNo}")
     public Mono<Result<Void>> delete(@PathVariable String routeNo,
-                                     @RequestParam(required = false) Integer expectVersion) {
+                                     @RequestParam Integer expectVersion) {
         return appService.delete(routeNo, expectVersion)
                 .thenReturn(Result.ok());
     }
